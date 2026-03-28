@@ -1,0 +1,24 @@
+;;; Directory Local Variables            -*- no-byte-compile: t -*-
+;;; For more information see (info "(emacs) Directory Variables")
+
+((nil . ((fill-column . 80)
+		 (indent-tabs-mode . nil)
+		 (tab-width . 4)
+		 (require-final-newline . t)))
+
+(c-mode . (
+			(indent-tabs-mode . nil)
+			(tab-width . 4)
+			(c-basic-offset . 4)
+			(c-default-style . "gnu")
+			(c-basic-offset . 4)
+			(c-offsets-alist . ((case-label . +)
+								(block-open . 0)
+								(block-close . 0)
+								(substatement-open . 0)
+								(brace-list-open . 0)
+								(brace-list-close . 0)))))
+
+((org-mode . ((org-use-sub-superscripts . nil)
+			   (org-export-with-sub-superscripts . nil)
+			   (tab-width . 8))))
