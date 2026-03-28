@@ -108,7 +108,8 @@ struct m4_node
 
         struct
         {
-            struct m4_node *child;
+            struct m4_node **children;
+            size_t count;
         } quoted;
     } data;
 
@@ -129,7 +130,7 @@ struct m4_abuf
     size_t len;
 };
 
-static struct m4_abuf abuf_empty = { 0 };
+static struct m4_abuf abuf_empty = { "", 0 };
 
 struct m4_macro;
 typedef struct m4_abuf *(*m4_macro_handler_t) (struct m4_ctx *,
@@ -353,23 +354,22 @@ bool
 m4_ctx_buffer (struct m4_ctx *ctx)
 {
     struct pollfd fd_info = { .fd = ctx->fd, .events = POLLIN };
+    int nfds = poll (&fd_info, 1, -1);
+
+    if (nfds < 0)
+        return false;
+
+    if (nfds == 0)
+        assert (false);
 
     for (;;)
     {
-        int nfds = poll (&fd_info, 1, -1);
-
-        if (nfds < 0)
-            return false;
-
-        if (nfds == 0)
-            continue;
-
         if (ctx->buf_size >= ctx->buf_cap)
         {
             char *new_buf = realloc (ctx->buf, ctx->buf_cap + 1024);
 
             if (!new_buf)
-                return true;
+                return false;
 
             ctx->buf = new_buf;
             ctx->buf_cap += 1024;
@@ -466,13 +466,13 @@ m4_token_type_str (enum m4_token_type type)
 
         case TOKEN_RPAREN:
             return "(";
+
+        case TOKEN_LQUOTE:
+            return "left quote";
+
+        case TOKEN_RQUOTE:
+            return "right quote";
     }
-
-    if (type == TOKEN_LQUOTE)
-        return "left quote";
-
-    if (type == TOKEN_RQUOTE)
-        return "right quote";
 
     return "<UNKNOWN>";
 }
@@ -557,9 +557,9 @@ m4_lex (struct m4_ctx *ctx, struct m4_tokens *tokens)
         if (is_single_char)
         {
             if (!m4_lex_push_token (ctx, tokens, type,
-                                    strdup ((char[]){ c, 0 }), 1,
-                                    (size_t[2]){ ctx->line, ctx->col },
-                                    (size_t[2]){ ctx->line, ctx->col + 1 }))
+                                    strdup ((char[]) { c, 0 }), 1,
+                                    (size_t[2]) { ctx->line, ctx->col },
+                                    (size_t[2]) { ctx->line, ctx->col + 1 }))
                 return LEX_FAILURE;
 
             ctx->col++;
@@ -637,8 +637,8 @@ m4_lex (struct m4_ctx *ctx, struct m4_tokens *tokens)
     if (ctx->is_eof)
     {
         if (!m4_lex_push_token (ctx, tokens, TOKEN_EOF, strdup ("EOF"), 3,
-                                (size_t[2]){ ctx->line, ctx->col },
-                                (size_t[2]){ ctx->line, ctx->col }))
+                                (size_t[2]) { ctx->line, ctx->col },
+                                (size_t[2]) { ctx->line, ctx->col }))
             return LEX_FAILURE;
     }
 
@@ -651,7 +651,7 @@ m4_parser_error (struct m4_node *node, const char *format, ...)
 {
     va_list args;
     va_start (args, format);
-    (void) fprintf (stderr, "%s:%i:%i: ", node->filename, node->line_start,
+    (void) fprintf (stderr, "%s:%zu:%zu: ", node->filename, node->line_start,
                     node->col_start);
     (void) vfprintf (stderr, format, args);
     fputc ('\n', stderr);
@@ -665,7 +665,7 @@ m4_generic_error (const char *filename, size_t line_start, size_t col_start,
 {
     va_list args;
     va_start (args, format);
-    (void) fprintf (stderr, "%s:%i:%i: ", filename, line_start, col_start);
+    (void) fprintf (stderr, "%s:%zu:%zu: ", filename, line_start, col_start);
     (void) vfprintf (stderr, format, args);
     fputc ('\n', stderr);
     va_end (args);
@@ -760,7 +760,10 @@ m4_parser_free_node (struct m4_node *node)
             break;
 
         case NODE_QUOTED:
-            m4_parser_free_node (node->data.quoted.child);
+            for (size_t i = 0; i < node->data.quoted.count; i++)
+                m4_parser_free_node (node->data.quoted.children[i]);
+
+            free (node->data.quoted.children);
             break;
 
         case NODE_ID:
@@ -814,12 +817,27 @@ m4_parser_parse_quoted (struct m4_ctx *ctx, struct m4_tokens *tokens)
     node->line_start = token->line_start;
     node->col_start = token->col_start;
 
-    struct m4_node *child = m4_parser_parse_expr (ctx, tokens);
+    struct m4_node **children = NULL;
+    size_t count = 0;
 
-    if (!child)
+    while (m4_parser_peek (ctx, tokens)->type != TOKEN_RQUOTE)
     {
-        m4_parser_free_node (node);
-        return NULL;
+        struct m4_node *child = m4_parser_parse_expr (ctx, tokens);
+
+        if (!child)
+            goto quote_err_end;
+
+        struct m4_node **new_children
+            = realloc (children, sizeof (*children) * (count + 1));
+
+        if (!new_children)
+        {
+            m4_parser_free_node (child);
+            goto quote_err_end;
+        }
+
+        children = new_children;
+        children[count++] = child;
     }
 
     const struct m4_token *end_token
@@ -827,12 +845,16 @@ m4_parser_parse_quoted (struct m4_ctx *ctx, struct m4_tokens *tokens)
 
     if (!end_token)
     {
-        m4_parser_free_node (child);
+    quote_err_end:
+        for (size_t i = 0; i < count; i++)
+            m4_parser_free_node (children[i]);
+
         m4_parser_free_node (node);
         return NULL;
     }
 
-    node->data.quoted.child = child;
+    node->data.quoted.children = children;
+    node->data.quoted.count = count;
     node->line_end = end_token->line_end;
     node->col_end = end_token->col_end;
 
@@ -866,6 +888,8 @@ struct m4_node *
 m4_parser_parse_expr (struct m4_ctx *ctx, struct m4_tokens *tokens)
 {
     const struct m4_token *token = m4_parser_peek (ctx, tokens);
+
+    printf ("Token: %s\n", m4_token_type_str (token->type));
 
     switch (token->type)
     {
@@ -951,14 +975,13 @@ m4_node_print (struct m4_node *node, int indent)
         case NODE_MACRO_CALL:
             printf ("%*.sMacroCallNode (", indent, "");
             m4_node_print (node->data.macro_call.macro, 0);
-            printf ("%s) {\n");
+            printf ("%*.s) {\n", indent, "");
 
             for (size_t i = 0; i < node->data.macro_call.argc; i++)
             {
                 m4_node_print (node->data.macro_call.args[i], indent + 2);
-                printf ("%*.s%s",
-                        i == node->data.macro_call.argc - 1 ? "" : ",\n",
-                        indent, "");
+                printf ("%*.s%s", indent, "",
+                        i == node->data.macro_call.argc - 1 ? "" : ",\n");
             }
 
             printf ("%*.s}\n", indent, "");
@@ -971,7 +994,12 @@ m4_node_print (struct m4_node *node, int indent)
 
         case NODE_QUOTED:
             printf ("%*.sQuotedNode {\n", indent, "");
-            m4_node_print (node->data.quoted.child, indent + 2);
+
+            for (size_t i = 0; i < node->data.quoted.count; i++)
+            {
+                m4_node_print (node->data.quoted.children[i], indent + 2);
+            }
+
             printf ("%*.s}\n", indent, "");
             break;
 
@@ -1048,7 +1076,24 @@ struct m4_abuf *
 m4_eval_quoted (struct m4_ctx *ctx, struct m4_node *node)
 {
     assert (node->type == NODE_QUOTED);
-    return m4_eval (ctx, node->data.quoted.child);
+
+    /* PROBLEMATIC: Do not eval quoted expressions directly! */
+    struct m4_abuf *quoted_abuf = NULL;
+
+    for (size_t i = 0; i < node->data.quoted.count; i++)
+    {
+        struct m4_abuf *abuf = m4_eval (ctx, node->data.quoted.children[i]);
+
+        if (!abuf)
+            return NULL;
+
+        if (!quoted_abuf)
+            quoted_abuf = abuf;
+        else
+            m4_abuf_append_abuf_free (quoted_abuf, abuf);
+    }
+
+    return quoted_abuf ? quoted_abuf : ABUF_EMPTY;
 }
 
 struct m4_abuf *
@@ -1138,7 +1183,7 @@ m4_process (struct m4_ctx *ctx)
 
         for (size_t i = 0; i < tokens.count; i++)
         {
-            printf ("%i: ", i);
+            printf ("%zu: ", i);
             m4_token_print (&tokens.list[i]);
         }
 #endif /* NDEBUG */
