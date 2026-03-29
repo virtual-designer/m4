@@ -21,7 +21,7 @@ struct m4_ctx
     char *buf;
     size_t buf_size;
     size_t buf_cap;
-    char *lex_buf;
+    size_t lex_off;
     bool is_eof;
     size_t line, col;
     size_t parser_index;
@@ -53,6 +53,7 @@ struct m4_token
     size_t line_start, col_start;
     size_t line_end, col_end;
     const char *filename;
+    struct m4_token *next; /* Inside AST nodes */
 };
 
 struct m4_tokens
@@ -76,6 +77,8 @@ enum m4_node_type
     NODE_TEXT,
     NODE_QUOTED,
 };
+
+struct m4_abuf;
 
 struct m4_node
 {
@@ -119,22 +122,19 @@ struct m4_node
     size_t line_end, col_end;
     const char *filename;
     size_t ref_count;
+
+    struct m4_abuf *src;
 };
 
-#define PARSER_AGAIN ((struct m4_token *) (void *) (-1))
-#define PARSER_PROPAGATE_NULL(value)                                           \
-    if (!value)                                                                \
-        return NULL;
-#define PARSER_PROPAGATE_AGAIN(value, dec)                                     \
-    if (value == PARSER_AGAIN)                                                 \
-    {                                                                          \
-        if (ctx->parser_index - (dec) >= 0)                                    \
-            ctx->parser_index -= (dec);                                        \
-        else                                                                   \
-            ctx->parser_index = 0;                                             \
-                                                                               \
-        return PARSER_AGAIN;                                                   \
-    }
+#define PARSER_TOKEN_UNEXPECTED ((struct m4_token *) (void *) (-1))
+
+enum m4_parser_code
+{
+    PARSER_DONE,
+    PARSER_ERR_MEMORY,
+    PARSER_ERR_AGAIN,
+    PARSER_ERR_AST,
+};
 
 #define ABUF_EMPTY (&abuf_empty)
 #define ABUF_ERR (NULL)
@@ -147,7 +147,7 @@ struct m4_abuf
     size_t len;
 };
 
-static struct m4_abuf abuf_empty = { "", 0 };
+static struct m4_abuf abuf_empty = { "", 1, 0 };
 
 struct m4_macro;
 typedef struct m4_abuf *(*m4_macro_handler_t) (struct m4_ctx *,
@@ -203,6 +203,7 @@ m4_abuf_append (struct m4_abuf *abuf, const char *append, size_t len)
 {
     assert (abuf != NULL);
     assert (append != NULL);
+    assert (abuf != ABUF_EMPTY);
 
     char *raw = realloc (abuf->raw, abuf->cap + len);
 
@@ -213,8 +214,7 @@ m4_abuf_append (struct m4_abuf *abuf, const char *append, size_t len)
     memcpy (abuf->raw + abuf->len, append, len);
     abuf->raw[abuf->len + len] = 0;
     abuf->len += len;
-    abuf->cap += len + 1;
-
+    abuf->cap += len;
     return true;
 }
 
@@ -231,12 +231,18 @@ m4_abuf_free (struct m4_abuf *abuf)
 bool
 m4_abuf_append_abuf (struct m4_abuf *dest_abuf, const struct m4_abuf *src_abuf)
 {
+    if (src_abuf == ABUF_EMPTY)
+        return true;
+
     return m4_abuf_append (dest_abuf, src_abuf->raw, src_abuf->len);
 }
 
 bool
 m4_abuf_append_abuf_free (struct m4_abuf *dest_abuf, struct m4_abuf *src_abuf)
 {
+    if (src_abuf == ABUF_EMPTY)
+        return true;
+
     if (!m4_abuf_append_abuf (dest_abuf, src_abuf))
         return false;
 
@@ -479,10 +485,10 @@ m4_token_type_str (enum m4_token_type type)
             return "text";
 
         case TOKEN_LPAREN:
-            return "(";
+            return "left parenthesis";
 
         case TOKEN_RPAREN:
-            return "(";
+            return "right parenthesis";
 
         case TOKEN_COMMA:
             return "comma";
@@ -516,11 +522,8 @@ m4_tokens_cleanup (const struct m4_tokens *tokens)
 enum m4_lex_code
 m4_lex (struct m4_ctx *ctx, struct m4_tokens *tokens)
 {
-    if (!ctx->lex_buf)
-        ctx->lex_buf = ctx->buf;
-
-    char *buf = ctx->lex_buf;
-    size_t size = ctx->buf + ctx->buf_size - ctx->lex_buf;
+    char *buf = ctx->buf + ctx->lex_off;
+    size_t size = ctx->buf_size - ctx->lex_off;
     size_t i = 0;
 
     char *text_ptr = NULL;
@@ -579,9 +582,9 @@ m4_lex (struct m4_ctx *ctx, struct m4_tokens *tokens)
         if (is_single_char)
         {
             if (!m4_lex_push_token (ctx, tokens, type,
-                                    strdup ((char[]) { c, 0 }), 1,
-                                    (size_t[2]) { ctx->line, ctx->col },
-                                    (size_t[2]) { ctx->line, ctx->col + 1 }))
+                                    strdup ((char[]){ c, 0 }), 1,
+                                    (size_t[2]){ ctx->line, ctx->col },
+                                    (size_t[2]){ ctx->line, ctx->col + 1 }))
                 return LEX_FAILURE;
 
             ctx->col++;
@@ -619,7 +622,7 @@ m4_lex (struct m4_ctx *ctx, struct m4_tokens *tokens)
             {
                 i = prev_i;
                 ctx->col = prev_col;
-                ctx->lex_buf = &buf[i];
+                ctx->lex_off += i;
                 return LEX_AGAIN;
             }
 
@@ -659,12 +662,12 @@ m4_lex (struct m4_ctx *ctx, struct m4_tokens *tokens)
     if (ctx->is_eof)
     {
         if (!m4_lex_push_token (ctx, tokens, TOKEN_EOF, strdup ("EOF"), 3,
-                                (size_t[2]) { ctx->line, ctx->col },
-                                (size_t[2]) { ctx->line, ctx->col }))
+                                (size_t[2]){ ctx->line, ctx->col },
+                                (size_t[2]){ ctx->line, ctx->col }))
             return LEX_FAILURE;
     }
 
-    ctx->lex_buf = &buf[i];
+    ctx->lex_off += i;
     return LEX_SUCCESS;
 }
 
@@ -705,7 +708,7 @@ static inline const struct m4_token *
 m4_parser_peek (struct m4_ctx *ctx, struct m4_tokens *tokens)
 {
     return ctx->parser_index < tokens->count ? &tokens->list[ctx->parser_index]
-                                             : PARSER_AGAIN;
+                                             : NULL;
 }
 
 static inline const struct m4_token *
@@ -713,7 +716,7 @@ m4_parser_consume (struct m4_ctx *ctx, struct m4_tokens *tokens)
 {
     return ctx->parser_index < tokens->count
                ? &tokens->list[ctx->parser_index++]
-               : PARSER_AGAIN;
+               : NULL;
 }
 
 static inline const struct m4_token *
@@ -722,8 +725,8 @@ m4_parser_expect (struct m4_ctx *ctx, struct m4_tokens *tokens,
 {
     const struct m4_token *token = m4_parser_peek (ctx, tokens);
 
-    if (token == PARSER_AGAIN)
-        return PARSER_AGAIN;
+    if (!token)
+        return NULL;
 
     if (token->type != type)
     {
@@ -739,7 +742,7 @@ m4_parser_expect (struct m4_ctx *ctx, struct m4_tokens *tokens,
                               token->val);
         }
 
-        return NULL;
+        return PARSER_TOKEN_UNEXPECTED;
     }
 
     m4_parser_consume (ctx, tokens);
@@ -756,14 +759,26 @@ m4_parser_new_node (struct m4_ctx *ctx, enum m4_node_type type)
 
     node->filename = ctx->filename;
     node->type = type;
+    node->ref_count = 1;
 
     return node;
+}
+
+void
+m4_parser_node_ref (struct m4_node *node)
+{
+    node->ref_count++;
 }
 
 void
 m4_parser_free_node (struct m4_node *node)
 {
     if (!node)
+        return;
+
+    node->ref_count--;
+
+    if (node->ref_count > 0)
         return;
 
     switch (node->type)
@@ -799,25 +814,33 @@ m4_parser_free_node (struct m4_node *node)
             break;
     }
 
+    if (node->src)
+        m4_abuf_free (node->src);
+
     free (node);
 }
 
 /* Declare recursively-used functions early. */
-struct m4_node *m4_parser_parse_expr (struct m4_ctx *ctx,
-                                      struct m4_tokens *tokens);
+enum m4_parser_code m4_parser_parse_expr (struct m4_ctx *ctx,
+                                          struct m4_tokens *tokens,
+                                          struct m4_node **out);
 
-struct m4_node *
-m4_parser_parse_text (struct m4_ctx *ctx, struct m4_tokens *tokens)
+enum m4_parser_code
+m4_parser_parse_text (struct m4_ctx *ctx, struct m4_tokens *tokens,
+                      struct m4_node **out)
 {
     const struct m4_token *token = m4_parser_expect (ctx, tokens, TOKEN_TEXT);
 
-    PARSER_PROPAGATE_NULL (token);
-    PARSER_PROPAGATE_AGAIN (token, 1);
+    if (!token)
+        return PARSER_ERR_AGAIN;
+
+    if (token == PARSER_TOKEN_UNEXPECTED)
+        return PARSER_ERR_AST;
 
     struct m4_node *node = m4_parser_new_node (ctx, NODE_TEXT);
 
     if (!node)
-        return NULL;
+        return PARSER_ERR_MEMORY;
 
     node->line_start = token->line_start;
     node->col_start = token->col_start;
@@ -826,74 +849,68 @@ m4_parser_parse_text (struct m4_ctx *ctx, struct m4_tokens *tokens)
     node->data.text.text = strdup (token->val);
     node->data.text.len = token->len;
 
-    return node;
+    *out = node;
+    return PARSER_DONE;
 }
 
-struct m4_node *
-m4_parser_parse_quoted (struct m4_ctx *ctx, struct m4_tokens *tokens)
+enum m4_parser_code
+m4_parser_parse_quoted (struct m4_ctx *ctx, struct m4_tokens *tokens,
+                        struct m4_node **out)
 {
     size_t parser_index = ctx->parser_index;
     const struct m4_token *token = m4_parser_expect (ctx, tokens, TOKEN_LQUOTE);
 
-    PARSER_PROPAGATE_NULL (token);
-    PARSER_PROPAGATE_AGAIN (token, 1);
+    if (!token)
+        return PARSER_ERR_AGAIN;
+
+    if (token == PARSER_TOKEN_UNEXPECTED)
+        return PARSER_ERR_AST;
 
     struct m4_node *node = m4_parser_new_node (ctx, NODE_QUOTED);
 
     if (!node)
-        return NULL;
+        return PARSER_ERR_MEMORY;
 
     node->line_start = token->line_start;
     node->col_start = token->col_start;
 
     struct m4_node **children = NULL;
     size_t count = 0;
+    enum m4_parser_code code = PARSER_DONE;
 
     while (true)
     {
-        struct m4_token *token = m4_parser_peek (ctx, tokens);
+        const struct m4_token *token = m4_parser_peek (ctx, tokens);
 
-        if (token == PARSER_AGAIN)
+        if (!token)
         {
-            ctx->parser_index = parser_index;
-
-            for (size_t i = 0; i < count; i++)
-                m4_parser_free_node (children[i]);
-
-            m4_parser_free_node (node);
-            return PARSER_AGAIN;
+            code = PARSER_ERR_AGAIN;
+            goto parser_parse_quoted_err;
         }
 
-        if (token->type != TOKEN_RQUOTE)
+        if (token == PARSER_TOKEN_UNEXPECTED)
+        {
+            code = PARSER_ERR_AST;
+            goto parser_parse_quoted_err;
+        }
+
+        if (token->type == TOKEN_RQUOTE)
             break;
 
-        struct m4_node *child = m4_parser_parse_expr (ctx, tokens);
+        struct m4_node *child;
+        code = m4_parser_parse_expr (ctx, tokens, &child);
 
-        if (!child || child == PARSER_AGAIN)
-        {
-            for (size_t i = 0; i < count; i++)
-                m4_parser_free_node (children[i]);
-
-            m4_parser_free_node (node);
-
-            if (child == PARSER_AGAIN)
-                ctx->parser_index = parser_index;
-
-            return child;
-        }
+        if (code != PARSER_DONE)
+            goto parser_parse_quoted_err;
 
         struct m4_node **new_children
             = realloc (children, sizeof (*children) * (count + 1));
 
         if (!new_children)
         {
+            code = PARSER_ERR_MEMORY;
             m4_parser_free_node (child);
-
-            for (size_t i = 0; i < count; i++)
-                m4_parser_free_node (children[i]);
-
-            m4_parser_free_node (node);
-            return NULL;
+            goto parser_parse_quoted_err;
         }
 
         children = new_children;
@@ -903,17 +920,16 @@ m4_parser_parse_quoted (struct m4_ctx *ctx, struct m4_tokens *tokens)
     const struct m4_token *end_token
         = m4_parser_expect (ctx, tokens, TOKEN_RQUOTE);
 
-    if (!end_token || end_token == PARSER_AGAIN)
+    if (!end_token)
     {
-        for (size_t i = 0; i < count; i++)
-            m4_parser_free_node (children[i]);
+        code = PARSER_ERR_AGAIN;
+        goto parser_parse_quoted_err;
+    }
 
-        m4_parser_free_node (node);
-
-        if (end_token == PARSER_AGAIN)
-            ctx->parser_index = parser_index;
-
-        return end_token;
+    if (end_token == PARSER_TOKEN_UNEXPECTED)
+    {
+        code = PARSER_ERR_AST;
+        goto parser_parse_quoted_err;
     }
 
     node->data.quoted.children = children;
@@ -921,21 +937,36 @@ m4_parser_parse_quoted (struct m4_ctx *ctx, struct m4_tokens *tokens)
     node->line_end = end_token->line_end;
     node->col_end = end_token->col_end;
 
-    return node;
+    *out = node;
+    return PARSER_DONE;
+
+parser_parse_quoted_err:
+    ctx->parser_index = parser_index;
+
+    for (size_t i = 0; i < count; i++)
+        m4_parser_free_node (children[i]);
+
+    free (children);
+    m4_parser_free_node (node);
+    return code;
 }
 
-struct m4_node *
-m4_parser_parse_id (struct m4_ctx *ctx, struct m4_tokens *tokens)
+enum m4_parser_code
+m4_parser_parse_id (struct m4_ctx *ctx, struct m4_tokens *tokens,
+                    struct m4_node **out)
 {
     const struct m4_token *token = m4_parser_expect (ctx, tokens, TOKEN_ID);
 
-    PARSER_PROPAGATE_NULL (token);
-    PARSER_PROPAGATE_AGAIN (token, 1);
+    if (!token)
+        return PARSER_ERR_AGAIN;
+
+    if (token == PARSER_TOKEN_UNEXPECTED)
+        return PARSER_ERR_AST;
 
     struct m4_node *node = m4_parser_new_node (ctx, NODE_ID);
 
     if (!node)
-        return NULL;
+        return PARSER_ERR_MEMORY;
 
     node->line_start = token->line_start;
     node->col_start = token->col_start;
@@ -944,24 +975,34 @@ m4_parser_parse_id (struct m4_ctx *ctx, struct m4_tokens *tokens)
     node->data.id.name = strdup (token->val);
     node->data.id.len = token->len;
 
-    return node;
+    *out = node;
+    return PARSER_DONE;
 }
 
-struct m4_node *
-m4_parser_parse_macro_call (struct m4_ctx *ctx, struct m4_tokens *tokens)
+enum m4_parser_code
+m4_parser_parse_macro_call (struct m4_ctx *ctx, struct m4_tokens *tokens,
+                            struct m4_node **out)
 {
-    size_t parser_index = ctx->parser_index;
-    struct m4_node *id = m4_parser_parse_id (ctx, tokens);
+    const size_t parser_index = ctx->parser_index;
+    struct m4_node *id;
+    enum m4_parser_code code;
 
-    PARSER_PROPAGATE_NULL (id);
-    PARSER_PROPAGATE_AGAIN (id, 0);
+    code = m4_parser_parse_id (ctx, tokens, &id);
 
-    const struct m4_token *lparen_token = m4_parser_expect (ctx, tokens, TOKEN_LPAREN);
-
-    if (!lparen_token || lparen_token == PARSER_AGAIN)
+    if (code != PARSER_DONE)
     {
+        ctx->parser_index = parser_index;
+        return code;
+    }
+
+    const struct m4_token *lparen_token
+        = m4_parser_expect (ctx, tokens, TOKEN_LPAREN);
+
+    if (!lparen_token || lparen_token == PARSER_TOKEN_UNEXPECTED)
+    {
+        ctx->parser_index = parser_index;
         m4_parser_free_node (id);
-        return lparen_token;
+        return !lparen_token ? PARSER_ERR_AGAIN : PARSER_ERR_AST;
     }
 
     struct m4_node *node = m4_parser_new_node (ctx, NODE_MACRO_CALL);
@@ -971,7 +1012,7 @@ m4_parser_parse_macro_call (struct m4_ctx *ctx, struct m4_tokens *tokens)
     if (!node)
     {
         m4_parser_free_node (id);
-        return NULL;
+        return PARSER_ERR_MEMORY;
     }
 
     node->line_start = id->line_start;
@@ -980,28 +1021,56 @@ m4_parser_parse_macro_call (struct m4_ctx *ctx, struct m4_tokens *tokens)
 
     while (m4_parser_peek (ctx, tokens)->type != TOKEN_RPAREN)
     {
-        struct m4_node *arg = m4_parser_parse_expr (ctx, tokens);
+        struct m4_node *arg;
+
+        code = m4_parser_parse_expr (ctx, tokens, &arg);
+
+        if (code != PARSER_DONE)
+            goto macro_call_parse_err;
+
         struct m4_node **argv_new
             = realloc (argv, sizeof (struct m4_node *) * (argc + 1));
 
-        if (!arg || !argv_new)
+        if (!argv_new)
         {
-        macro_call_parse_err:
-            m4_parser_free_node (node);
-
-            for (size_t i = 0; i < argc; i++)
-                m4_parser_free_node (argv[i]);
-
-            free (argv);
-            return NULL;
+            code = PARSER_ERR_MEMORY;
+            goto macro_call_parse_err;
         }
 
         argv = argv_new;
         argv[argc++] = arg;
 
-        if (m4_parser_peek (ctx, tokens)->type != TOKEN_RPAREN
-            && !m4_parser_expect (ctx, tokens, TOKEN_COMMA))
+        const struct m4_token *peeked_token = m4_parser_peek (ctx, tokens);
+
+        if (!peeked_token || peeked_token == PARSER_TOKEN_UNEXPECTED)
+        {
+            if (peeked_token == PARSER_TOKEN_UNEXPECTED)
+                code = PARSER_ERR_AST;
+            else
+                code = PARSER_ERR_AGAIN;
+
             goto macro_call_parse_err;
+        }
+
+        if (peeked_token->type != TOKEN_RPAREN
+            && m4_parser_expect (ctx, tokens, TOKEN_COMMA)
+                   == PARSER_TOKEN_UNEXPECTED)
+        {
+            code = PARSER_ERR_AST;
+            goto macro_call_parse_err;
+        }
+
+        continue;
+
+    macro_call_parse_err:
+        ctx->parser_index = parser_index;
+        m4_parser_free_node (node);
+
+        for (size_t i = 0; i < argc; i++)
+            m4_parser_free_node (argv[i]);
+
+        free (argv);
+        return code;
     }
 
     node->data.macro_call.argc = argc;
@@ -1010,55 +1079,70 @@ m4_parser_parse_macro_call (struct m4_ctx *ctx, struct m4_tokens *tokens)
     const struct m4_token *rparen_token
         = m4_parser_expect (ctx, tokens, TOKEN_RPAREN);
 
+    if (!rparen_token)
+    {
+        ctx->parser_index = parser_index;
+        m4_parser_free_node (node);
+        return PARSER_ERR_AGAIN;
+    }
+
+    if (rparen_token == PARSER_TOKEN_UNEXPECTED)
+    {
+        m4_parser_free_node (node);
+        return PARSER_ERR_AST;
+    }
+
     node->line_end = rparen_token->line_end;
     node->col_end = rparen_token->col_end;
 
-    return node;
+    *out = node;
+    return PARSER_DONE;
 }
 
-struct m4_node *
-m4_parser_parse_expr (struct m4_ctx *ctx, struct m4_tokens *tokens)
+enum m4_parser_code
+m4_parser_parse_expr (struct m4_ctx *ctx, struct m4_tokens *tokens, struct m4_node **out)
 {
-    const struct m4_token *token = m4_parser_peek (ctx, tokens);
-
     if (ctx->parser_index + 1 < tokens->count
         && tokens->list[ctx->parser_index].type == TOKEN_ID
         && tokens->list[ctx->parser_index + 1].type == TOKEN_LPAREN)
-        return m4_parser_parse_macro_call (ctx, tokens);
+        return m4_parser_parse_macro_call (ctx, tokens, out);
 
-    printf ("Token: %s\n", m4_token_type_str (token->type));
+    const struct m4_token *token = m4_parser_peek (ctx, tokens);
+
+    if (!token)
+        return PARSER_ERR_AGAIN;
 
     switch (token->type)
     {
         case TOKEN_TEXT:
-            return m4_parser_parse_text (ctx, tokens);
+            return m4_parser_parse_text (ctx, tokens, out);
 
         case TOKEN_LQUOTE:
-            return m4_parser_parse_quoted (ctx, tokens);
+            return m4_parser_parse_quoted (ctx, tokens, out);
 
         case TOKEN_ID:
-            return m4_parser_parse_id (ctx, tokens);
+            return m4_parser_parse_id (ctx, tokens, out);
 
         case TOKEN_EOF:
             m4_generic_error (ctx->filename, token->line_start,
                               token->col_start, "Unexpected end of file");
-            return NULL;
+            return PARSER_ERR_AST;
 
         default:
             m4_generic_error (ctx->filename, token->line_start,
                               token->col_start, "Unexpected token '%s'",
                               token->val);
-            return NULL;
+            return PARSER_ERR_AST;
     }
 }
 
-struct m4_node *
-m4_parser_parse (struct m4_ctx *ctx, struct m4_tokens *tokens)
+enum m4_parser_code
+m4_parser_parse (struct m4_ctx *ctx, struct m4_tokens *tokens, struct m4_node **out)
 {
     struct m4_node *root = m4_parser_new_node (ctx, NODE_ROOT);
 
     if (!root)
-        return NULL;
+        return PARSER_ERR_MEMORY;
 
     root->line_start = 1;
     root->col_end = 1;
@@ -1067,12 +1151,21 @@ m4_parser_parse (struct m4_ctx *ctx, struct m4_tokens *tokens)
 
     while (!m4_parser_is_eof (ctx, tokens))
     {
-        struct m4_node *child = m4_parser_parse_expr (ctx, tokens);
+        const size_t parser_index = ctx->parser_index;
+        struct m4_node *child;
+        enum m4_parser_code rc = m4_parser_parse_expr (ctx, tokens, &child);
 
-        if (!child)
+        if (rc == PARSER_ERR_AGAIN)
+        {
+            ctx->parser_index = parser_index;
+            *out = root;
+            return PARSER_ERR_AGAIN;
+        }
+
+        if (rc != PARSER_DONE)
         {
             m4_parser_free_node (root);
-            return NULL;
+            return rc;
         }
 
         struct m4_node **new_children
@@ -1083,14 +1176,15 @@ m4_parser_parse (struct m4_ctx *ctx, struct m4_tokens *tokens)
         {
             m4_parser_free_node (child);
             m4_parser_free_node (root);
-            return NULL;
+            return PARSER_ERR_MEMORY;
         }
 
         root->data.root.children = new_children;
         root->data.root.children[root->data.root.count++] = child;
     }
 
-    return root;
+    *out = root;
+    return PARSER_DONE;
 }
 
 void
@@ -1198,6 +1292,7 @@ struct m4_abuf *
 m4_eval_text (struct m4_ctx *ctx, struct m4_node *node)
 {
     assert (node->type == NODE_TEXT);
+    (void) ctx;
     return m4_abuf_from_str (node->data.text.text, node->data.text.len);
 }
 
@@ -1223,6 +1318,9 @@ m4_eval_quoted (struct m4_ctx *ctx, struct m4_node *node)
 
         if (!abuf)
             return NULL;
+
+        if (abuf == ABUF_EMPTY)
+            continue;
 
         if (!quoted_abuf)
             quoted_abuf = abuf;
@@ -1254,6 +1352,9 @@ m4_eval_root (struct m4_ctx *ctx, struct m4_node *node)
 
         if (!abuf)
             return NULL;
+
+        if (abuf == ABUF_EMPTY)
+            continue;
 
         if (!root_abuf)
             root_abuf = abuf;
@@ -1293,6 +1394,8 @@ m4_eval (struct m4_ctx *ctx, struct m4_node *node)
 bool
 m4_process (struct m4_ctx *ctx)
 {
+    struct m4_tokens prev_tokens = { 0 };
+
     while (!ctx->is_eof)
     {
         if (!m4_ctx_buffer (ctx))
@@ -1328,6 +1431,29 @@ m4_process (struct m4_ctx *ctx)
                 return false;
         }
 
+        if (prev_tokens.count)
+        {
+            struct m4_token *list = calloc (tokens.count + prev_tokens.count, sizeof (*list));
+
+            if (!list)
+            {
+                m4_tokens_cleanup (&tokens);
+                return false;
+            }
+
+            for (size_t i = 0; i < prev_tokens.count; i++)
+                list[i] = prev_tokens.list[i];
+
+            for (size_t i = 0; i < tokens.count; i++)
+                list[prev_tokens.count + i] = tokens.list[i];
+
+            free (tokens.list);
+            free (prev_tokens.list);
+            tokens.list = list;
+            tokens.count += prev_tokens.count;
+            prev_tokens.count = 0;
+        }
+
 #ifndef NDEBUG
         printf ("Tokens: %zu\n", tokens.count);
 
@@ -1340,12 +1466,35 @@ m4_process (struct m4_ctx *ctx)
 
         ctx->parser_index = 0;
 
-        struct m4_node *node = m4_parser_parse (ctx, &tokens);
+        struct m4_node *node = NULL;
+        enum m4_parser_code rc2 = m4_parser_parse (ctx, &tokens, &node);
 
-        if (!node)
+        if (rc2 != PARSER_ERR_AGAIN && rc2 != PARSER_DONE)
         {
             m4_tokens_cleanup (&tokens);
             return false;
+        }
+
+        if (rc2 == PARSER_ERR_AGAIN && ctx->parser_index < tokens.count)
+        {
+            struct m4_token *token_arr = realloc (
+                prev_tokens.list,
+                sizeof (*token_arr) * (prev_tokens.count + tokens.count - ctx->parser_index));
+
+            if (!token_arr)
+            {
+                m4_tokens_cleanup (&tokens);
+                return false;
+            }
+
+            prev_tokens.list = token_arr;
+
+            for (size_t i = ctx->parser_index, j = 0; i < tokens.count; i++, j++)
+                prev_tokens.list[prev_tokens.count + j] = tokens.list[i];
+
+            prev_tokens.count += tokens.count - ctx->parser_index;
+            free (tokens.list);
+            tokens.count = 0;
         }
 
 #ifndef NDEBUG
@@ -1353,9 +1502,10 @@ m4_process (struct m4_ctx *ctx)
 #endif /* NDEBUG */
 
         struct m4_abuf *abuf = m4_eval (ctx, node);
-
         m4_parser_free_node (node);
-        m4_tokens_cleanup (&tokens);
+
+        if (rc2 == PARSER_DONE)
+            m4_tokens_cleanup (&tokens);
 
         if (!abuf)
             return false;
@@ -1408,16 +1558,12 @@ m4_builtin_define_handler (struct m4_ctx *ctx, const struct m4_macro *def,
 
     struct m4_abuf *name_buf = argc > 0 ? m4_eval (ctx, argv[0]) : ABUF_EMPTY;
     struct m4_node *body = argc > 1 ? argv[1] : NULL;
-    char *name = NULL;
+    char *name = name_buf->raw;
 
-    if (name_buf != ABUF_EMPTY)
+    if (argc > 0)
     {
-        name = realloc (name_buf->raw, name_buf->len + 1);
-
-        if (!name)
-            return ABUF_ERR;
-
-        name[name_buf->len] = 0;
+        if (body)
+            m4_parser_node_ref (body);
 
         struct m4_macro *macro = m4_macro_create (name ? name : "", body);
 
