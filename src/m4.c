@@ -31,6 +31,7 @@ struct m4_ctx
 
 static int TOKEN_LQUOTE_VALUE = '`';
 static int TOKEN_RQUOTE_VALUE = '\'';
+static int TOKEN_COMMA_VALUE = ',';
 
 enum m4_token_type
 {
@@ -40,6 +41,7 @@ enum m4_token_type
     TOKEN_TEXT,
     TOKEN_LQUOTE,
     TOKEN_RQUOTE,
+    TOKEN_COMMA,
     TOKEN_EOF,
 };
 
@@ -90,7 +92,7 @@ struct m4_node
         struct
         {
             struct m4_node *macro;
-            struct m4_node **args;
+            struct m4_node **argv;
             size_t argc;
         } macro_call;
 
@@ -118,6 +120,21 @@ struct m4_node
     const char *filename;
     size_t ref_count;
 };
+
+#define PARSER_AGAIN ((struct m4_token *) (void *) (-1))
+#define PARSER_PROPAGATE_NULL(value)                                           \
+    if (!value)                                                                \
+        return NULL;
+#define PARSER_PROPAGATE_AGAIN(value, dec)                                     \
+    if (value == PARSER_AGAIN)                                                 \
+    {                                                                          \
+        if (ctx->parser_index - (dec) >= 0)                                    \
+            ctx->parser_index -= (dec);                                        \
+        else                                                                   \
+            ctx->parser_index = 0;                                             \
+                                                                               \
+        return PARSER_AGAIN;                                                   \
+    }
 
 #define ABUF_EMPTY (&abuf_empty)
 #define ABUF_ERR (NULL)
@@ -467,6 +484,9 @@ m4_token_type_str (enum m4_token_type type)
         case TOKEN_RPAREN:
             return "(";
 
+        case TOKEN_COMMA:
+            return "comma";
+
         case TOKEN_LQUOTE:
             return "left quote";
 
@@ -528,6 +548,8 @@ m4_lex (struct m4_ctx *ctx, struct m4_tokens *tokens)
                     type = TOKEN_LQUOTE;
                 else if (c == TOKEN_RQUOTE_VALUE)
                     type = TOKEN_RQUOTE;
+                else if (c == TOKEN_COMMA_VALUE)
+                    type = TOKEN_COMMA;
                 else
                     is_single_char = false;
         }
@@ -682,13 +704,16 @@ m4_parser_is_eof (struct m4_ctx *ctx, struct m4_tokens *tokens)
 static inline const struct m4_token *
 m4_parser_peek (struct m4_ctx *ctx, struct m4_tokens *tokens)
 {
-    return &tokens->list[ctx->parser_index];
+    return ctx->parser_index < tokens->count ? &tokens->list[ctx->parser_index]
+                                             : PARSER_AGAIN;
 }
 
 static inline const struct m4_token *
 m4_parser_consume (struct m4_ctx *ctx, struct m4_tokens *tokens)
 {
-    return &tokens->list[ctx->parser_index++];
+    return ctx->parser_index < tokens->count
+               ? &tokens->list[ctx->parser_index++]
+               : PARSER_AGAIN;
 }
 
 static inline const struct m4_token *
@@ -696,6 +721,9 @@ m4_parser_expect (struct m4_ctx *ctx, struct m4_tokens *tokens,
                   enum m4_token_type type)
 {
     const struct m4_token *token = m4_parser_peek (ctx, tokens);
+
+    if (token == PARSER_AGAIN)
+        return PARSER_AGAIN;
 
     if (token->type != type)
     {
@@ -749,10 +777,10 @@ m4_parser_free_node (struct m4_node *node)
 
         case NODE_MACRO_CALL:
             for (size_t i = 0; i < node->data.macro_call.argc; i++)
-                m4_parser_free_node (node->data.macro_call.args[i]);
+                m4_parser_free_node (node->data.macro_call.argv[i]);
 
             m4_parser_free_node (node->data.macro_call.macro);
-            free (node->data.macro_call.args);
+            free (node->data.macro_call.argv);
             break;
 
         case NODE_TEXT:
@@ -783,8 +811,8 @@ m4_parser_parse_text (struct m4_ctx *ctx, struct m4_tokens *tokens)
 {
     const struct m4_token *token = m4_parser_expect (ctx, tokens, TOKEN_TEXT);
 
-    if (!token)
-        return NULL;
+    PARSER_PROPAGATE_NULL (token);
+    PARSER_PROPAGATE_AGAIN (token, 1);
 
     struct m4_node *node = m4_parser_new_node (ctx, NODE_TEXT);
 
@@ -804,10 +832,11 @@ m4_parser_parse_text (struct m4_ctx *ctx, struct m4_tokens *tokens)
 struct m4_node *
 m4_parser_parse_quoted (struct m4_ctx *ctx, struct m4_tokens *tokens)
 {
+    size_t parser_index = ctx->parser_index;
     const struct m4_token *token = m4_parser_expect (ctx, tokens, TOKEN_LQUOTE);
 
-    if (!token)
-        return NULL;
+    PARSER_PROPAGATE_NULL (token);
+    PARSER_PROPAGATE_AGAIN (token, 1);
 
     struct m4_node *node = m4_parser_new_node (ctx, NODE_QUOTED);
 
@@ -820,12 +849,38 @@ m4_parser_parse_quoted (struct m4_ctx *ctx, struct m4_tokens *tokens)
     struct m4_node **children = NULL;
     size_t count = 0;
 
-    while (m4_parser_peek (ctx, tokens)->type != TOKEN_RQUOTE)
+    while (true)
     {
+        struct m4_token *token = m4_parser_peek (ctx, tokens);
+
+        if (token == PARSER_AGAIN)
+        {
+            ctx->parser_index = parser_index;
+
+            for (size_t i = 0; i < count; i++)
+                m4_parser_free_node (children[i]);
+
+            m4_parser_free_node (node);
+            return PARSER_AGAIN;
+        }
+
+        if (token->type != TOKEN_RQUOTE)
+            break;
+
         struct m4_node *child = m4_parser_parse_expr (ctx, tokens);
 
-        if (!child)
-            goto quote_err_end;
+        if (!child || child == PARSER_AGAIN)
+        {
+            for (size_t i = 0; i < count; i++)
+                m4_parser_free_node (children[i]);
+
+            m4_parser_free_node (node);
+
+            if (child == PARSER_AGAIN)
+                ctx->parser_index = parser_index;
+
+            return child;
+        }
 
         struct m4_node **new_children
             = realloc (children, sizeof (*children) * (count + 1));
@@ -833,7 +888,12 @@ m4_parser_parse_quoted (struct m4_ctx *ctx, struct m4_tokens *tokens)
         if (!new_children)
         {
             m4_parser_free_node (child);
-            goto quote_err_end;
+
+            for (size_t i = 0; i < count; i++)
+                m4_parser_free_node (children[i]);
+
+            m4_parser_free_node (node);
+            return NULL;
         }
 
         children = new_children;
@@ -843,14 +903,17 @@ m4_parser_parse_quoted (struct m4_ctx *ctx, struct m4_tokens *tokens)
     const struct m4_token *end_token
         = m4_parser_expect (ctx, tokens, TOKEN_RQUOTE);
 
-    if (!end_token)
+    if (!end_token || end_token == PARSER_AGAIN)
     {
-    quote_err_end:
         for (size_t i = 0; i < count; i++)
             m4_parser_free_node (children[i]);
 
         m4_parser_free_node (node);
-        return NULL;
+
+        if (end_token == PARSER_AGAIN)
+            ctx->parser_index = parser_index;
+
+        return end_token;
     }
 
     node->data.quoted.children = children;
@@ -866,8 +929,8 @@ m4_parser_parse_id (struct m4_ctx *ctx, struct m4_tokens *tokens)
 {
     const struct m4_token *token = m4_parser_expect (ctx, tokens, TOKEN_ID);
 
-    if (!token)
-        return NULL;
+    PARSER_PROPAGATE_NULL (token);
+    PARSER_PROPAGATE_AGAIN (token, 1);
 
     struct m4_node *node = m4_parser_new_node (ctx, NODE_ID);
 
@@ -885,9 +948,83 @@ m4_parser_parse_id (struct m4_ctx *ctx, struct m4_tokens *tokens)
 }
 
 struct m4_node *
+m4_parser_parse_macro_call (struct m4_ctx *ctx, struct m4_tokens *tokens)
+{
+    size_t parser_index = ctx->parser_index;
+    struct m4_node *id = m4_parser_parse_id (ctx, tokens);
+
+    PARSER_PROPAGATE_NULL (id);
+    PARSER_PROPAGATE_AGAIN (id, 0);
+
+    const struct m4_token *lparen_token = m4_parser_expect (ctx, tokens, TOKEN_LPAREN);
+
+    if (!lparen_token || lparen_token == PARSER_AGAIN)
+    {
+        m4_parser_free_node (id);
+        return lparen_token;
+    }
+
+    struct m4_node *node = m4_parser_new_node (ctx, NODE_MACRO_CALL);
+    struct m4_node **argv = NULL;
+    size_t argc = 0;
+
+    if (!node)
+    {
+        m4_parser_free_node (id);
+        return NULL;
+    }
+
+    node->line_start = id->line_start;
+    node->col_start = id->col_start;
+    node->data.macro_call.macro = id;
+
+    while (m4_parser_peek (ctx, tokens)->type != TOKEN_RPAREN)
+    {
+        struct m4_node *arg = m4_parser_parse_expr (ctx, tokens);
+        struct m4_node **argv_new
+            = realloc (argv, sizeof (struct m4_node *) * (argc + 1));
+
+        if (!arg || !argv_new)
+        {
+        macro_call_parse_err:
+            m4_parser_free_node (node);
+
+            for (size_t i = 0; i < argc; i++)
+                m4_parser_free_node (argv[i]);
+
+            free (argv);
+            return NULL;
+        }
+
+        argv = argv_new;
+        argv[argc++] = arg;
+
+        if (m4_parser_peek (ctx, tokens)->type != TOKEN_RPAREN
+            && !m4_parser_expect (ctx, tokens, TOKEN_COMMA))
+            goto macro_call_parse_err;
+    }
+
+    node->data.macro_call.argc = argc;
+    node->data.macro_call.argv = argv;
+
+    const struct m4_token *rparen_token
+        = m4_parser_expect (ctx, tokens, TOKEN_RPAREN);
+
+    node->line_end = rparen_token->line_end;
+    node->col_end = rparen_token->col_end;
+
+    return node;
+}
+
+struct m4_node *
 m4_parser_parse_expr (struct m4_ctx *ctx, struct m4_tokens *tokens)
 {
     const struct m4_token *token = m4_parser_peek (ctx, tokens);
+
+    if (ctx->parser_index + 1 < tokens->count
+        && tokens->list[ctx->parser_index].type == TOKEN_ID
+        && tokens->list[ctx->parser_index + 1].type == TOKEN_LPAREN)
+        return m4_parser_parse_macro_call (ctx, tokens);
 
     printf ("Token: %s\n", m4_token_type_str (token->type));
 
@@ -979,7 +1116,7 @@ m4_node_print (struct m4_node *node, int indent)
 
             for (size_t i = 0; i < node->data.macro_call.argc; i++)
             {
-                m4_node_print (node->data.macro_call.args[i], indent + 2);
+                m4_node_print (node->data.macro_call.argv[i], indent + 2);
                 printf ("%*.s%s", indent, "",
                         i == node->data.macro_call.argc - 1 ? "" : ",\n");
             }
@@ -1097,6 +1234,16 @@ m4_eval_quoted (struct m4_ctx *ctx, struct m4_node *node)
 }
 
 struct m4_abuf *
+m4_eval_call (struct m4_ctx *ctx, struct m4_node *node)
+{
+    return m4_eval_macro (ctx, node->data.macro_call.macro->data.id.name,
+                          node->data.macro_call.macro->data.id.len,
+                          node->data.macro_call.macro->data.id.name,
+                          node->data.macro_call.argc,
+                          node->data.macro_call.argv);
+}
+
+struct m4_abuf *
 m4_eval_root (struct m4_ctx *ctx, struct m4_node *node)
 {
     struct m4_abuf *root_abuf = NULL;
@@ -1133,6 +1280,9 @@ m4_eval (struct m4_ctx *ctx, struct m4_node *node)
 
         case NODE_QUOTED:
             return m4_eval_quoted (ctx, node);
+
+        case NODE_MACRO_CALL:
+            return m4_eval_call (ctx, node);
 
         default:
             assert (false && "Unknown node");
